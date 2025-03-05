@@ -13,10 +13,6 @@ import (
 	"time"
 )
 
-const (
-	shardCount = 12 // 12 个分片
-)
-
 // LeaderboardService 定义排行榜服务接口
 type LeaderboardService interface {
 	UpdateScore(playerId string, score int, timestamp int)
@@ -38,6 +34,7 @@ type RedisRankBoard struct {
 	clusterClient *redis.ClusterClient // Redis Cluster 客户端
 	cache         *bigcache.BigCache   // 本地缓存
 	pool          *ants.Pool           // 协程池
+	shardCount    int                  // 分片数
 }
 
 // 全局变量
@@ -48,16 +45,16 @@ var (
 )
 
 // NewRedisRankBoard 初始化 Redis Cluster 客户端、本地缓存和协程池
-func NewRedisRankBoard(addrs []string) (*RedisRankBoard, error) {
+func NewRedisRankBoard(shardCount, poolSize, cacheExpire int, addrs []string) (*RedisRankBoard, error) {
 	clusterClient := redis.NewClusterClient(&redis.ClusterOptions{
 		Addrs: addrs, // Redis Cluster 节点地址
 	})
-
-	cache, err := bigcache.NewBigCache(bigcache.DefaultConfig(10 * time.Minute))
+	duration := time.Duration(cacheExpire) * time.Minute
+	cache, err := bigcache.NewBigCache(bigcache.DefaultConfig(duration))
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize bigcache: %v", err)
 	}
-	pool, err := ants.NewPool(1000, ants.WithOptions(ants.Options{
+	pool, err := ants.NewPool(poolSize, ants.WithOptions(ants.Options{
 		ExpiryDuration: 10 * time.Second,
 		Nonblocking:    true,
 	}))
@@ -68,13 +65,14 @@ func NewRedisRankBoard(addrs []string) (*RedisRankBoard, error) {
 		clusterClient: clusterClient,
 		cache:         cache,
 		pool:          pool,
+		shardCount:    shardCount,
 	}, nil
 }
 
 // InitRankBoard 初始化并返回全局 RedisRankBoard 对象
-func InitRankBoard(addrs []string) (*RedisRankBoard, error) {
+func InitRankBoard(shardCount, poolSize, cacheExpire int, addrs []string) (*RedisRankBoard, error) {
 	once.Do(func() {
-		rankBoard, initErr = NewRedisRankBoard(addrs)
+		rankBoard, initErr = NewRedisRankBoard(shardCount, poolSize, cacheExpire, addrs)
 	})
 	if initErr != nil {
 		return nil, fmt.Errorf("failed to initialize RedisRankBoard: %v", initErr)
@@ -84,7 +82,7 @@ func InitRankBoard(addrs []string) (*RedisRankBoard, error) {
 
 // getShardID 根据 playerId 计算分片 ID
 func (r *RedisRankBoard) getShardID(playerId string) int {
-	return int(crc32.ChecksumIEEE([]byte(playerId))) % shardCount
+	return int(crc32.ChecksumIEEE([]byte(playerId))) % r.shardCount
 }
 
 // getShardKey 生成分片的 ZSet 键名
@@ -114,8 +112,8 @@ func (r *RedisRankBoard) GetPlayerRank(ctx context.Context, playerId string) int
 
 	// 使用协程池并发获取所有分片的局部排名
 	var wg sync.WaitGroup
-	localRankChan := make(chan int, shardCount)
-	for i := 0; i < shardCount; i++ {
+	localRankChan := make(chan int, r.shardCount)
+	for i := 0; i < r.shardCount; i++ {
 		wg.Add(1)
 		shard := i
 		_ = r.pool.Submit(func() {
@@ -157,8 +155,8 @@ func (r *RedisRankBoard) GetPlayerRank(ctx context.Context, playerId string) int
 // GetTopN 获取前 N 名玩家
 func (r *RedisRankBoard) GetTopN(ctx context.Context, n int) []RankInfo {
 	var wg sync.WaitGroup
-	resultChan := make(chan []redis.Z, shardCount)
-	for i := 0; i < shardCount; i++ {
+	resultChan := make(chan []redis.Z, r.shardCount)
+	for i := 0; i < r.shardCount; i++ {
 		wg.Add(1)
 		shard := i
 		_ = r.pool.Submit(func() {
@@ -199,8 +197,8 @@ func (r *RedisRankBoard) GetPlayerRankRange(ctx context.Context, playerId string
 	end := start + 2*rangeSize - 1
 
 	var wg sync.WaitGroup
-	resultChan := make(chan []redis.Z, shardCount)
-	for i := 0; i < shardCount; i++ {
+	resultChan := make(chan []redis.Z, r.shardCount)
+	for i := 0; i < r.shardCount; i++ {
 		wg.Add(1)
 		shard := i
 		_ = r.pool.Submit(func() {
@@ -237,8 +235,8 @@ func (r *RedisRankBoard) GetDenseRank(ctx context.Context, playerId string) int 
 	}
 
 	var wg sync.WaitGroup
-	uniqueHigherChan := make(chan int, shardCount)
-	for i := 0; i < shardCount; i++ {
+	uniqueHigherChan := make(chan int, r.shardCount)
+	for i := 0; i < r.shardCount; i++ {
 		wg.Add(1)
 		shard := i
 		_ = r.pool.Submit(func() {
