@@ -91,16 +91,33 @@ func (r *RedisRankBoard) getShardKey(shardID int) string {
 }
 
 // UpdateScore 更新玩家的分数和时间戳
-func (r *RedisRankBoard) UpdateScore(ctx context.Context, playerId string, score int, timestamp int) {
+func (r *RedisRankBoard) UpdateScore(ctx context.Context, playerId string, score int, timestamp int) error {
 	shardID := r.getShardID(playerId)
 	key := r.getShardKey(shardID)
 	// 组合分数：score + (1 - timestamp/1e12)
 	combinedScore := float64(score) + (1 - float64(timestamp)/1e12)
 
-	r.clusterClient.ZAdd(ctx, key, &redis.Z{
-		Score:  combinedScore,
-		Member: playerId,
-	})
+	// 检查玩家是否已存在于 ZSet 中
+	_, err := r.clusterClient.ZScore(ctx, key, playerId).Result()
+	if err != nil && err != redis.Nil {
+		return fmt.Errorf("failed to check player score: %v", err)
+	}
+
+	if err == redis.Nil {
+		// 玩家不存在，使用 ZAdd 添加新元素
+		if err := r.clusterClient.ZAdd(ctx, key, &redis.Z{
+			Score:  combinedScore,
+			Member: playerId,
+		}).Err(); err != nil {
+			return fmt.Errorf("failed to add new player score: %v", err)
+		}
+	} else {
+		// 玩家已存在，使用 ZINCRBY 累加积分
+		if err := r.clusterClient.ZIncrBy(ctx, key, combinedScore, playerId).Err(); err != nil {
+			return fmt.Errorf("failed to increment player score: %v", err)
+		}
+	}
+	return nil
 }
 
 // GetPlayerRank 获取玩家的全局排名
